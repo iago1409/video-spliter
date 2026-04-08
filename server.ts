@@ -3,7 +3,6 @@ import multer from 'multer';
 import ffmpeg from 'fluent-ffmpeg';
 import ffmpegPath from 'ffmpeg-static';
 import ffprobePath from 'ffprobe-static';
-import archiver from 'archiver';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -33,13 +32,20 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // Job tracking for long-running processes
+interface SegmentInfo {
+  index: number;
+  name: string;
+  sizeMB: string;
+  downloadUrl: string;
+}
+
 interface Job {
   id: string;
   status: 'processing' | 'completed' | 'error';
+  stage: 'concatenating' | 'probing' | 'splitting' | 'done';
   progress: number;
   error?: string;
-  downloadUrl?: string;
-  zipSize?: number;
+  segments?: SegmentInfo[];
 }
 const jobs = new Map<string, Job>();
 
@@ -145,7 +151,7 @@ app.post('/api/finalize-upload', async (req, res) => {
 
   // Create a background job
   const jobId = uploadId;
-  jobs.set(jobId, { id: jobId, status: 'processing', progress: 0 });
+  jobs.set(jobId, { id: jobId, status: 'processing', stage: 'concatenating', progress: 0 });
 
   // Start processing in the background
   processVideoJob(jobId, fileName, totalChunks, parts, splitMode, minutes).catch(err => {
@@ -153,6 +159,7 @@ app.post('/api/finalize-upload', async (req, res) => {
     jobs.set(jobId, { 
       id: jobId, 
       status: 'error', 
+      stage: 'done',
       progress: 0, 
       error: err instanceof Error ? err.message : String(err) 
     });
@@ -167,7 +174,6 @@ async function processVideoJob(uploadId: string, fileName: string, totalChunks: 
   const chunkDir = path.join(uploadsDir, `chunks_${uploadId}`);
   const inputPath = path.join(uploadsDir, `input_${uploadId}_${sanitizedFileName}`);
   const outputDir = path.join(uploadsDir, `split_${uploadId}`);
-  const zipPath = path.join(uploadsDir, `final_${uploadId}.zip`);
 
   try {
     const updateJob = (data: Partial<Job>) => {
@@ -177,7 +183,7 @@ async function processVideoJob(uploadId: string, fileName: string, totalChunks: 
 
     // Concatenate chunks using streams for better performance with large files
     console.log(`Job ${uploadId}: Concatenando ${totalChunks} chunks...`);
-    updateJob({ progress: 10 });
+    updateJob({ stage: 'concatenating', progress: 5 });
     
     if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
     
@@ -192,6 +198,9 @@ async function processVideoJob(uploadId: string, fileName: string, totalChunks: 
       const chunkBuffer = fs.readFileSync(chunkPath);
       writeStream.write(chunkBuffer);
       fs.unlinkSync(chunkPath); 
+      // Update progress during concatenation (5-30%)
+      const concatProgress = 5 + Math.round((i / totalChunks) * 25);
+      updateJob({ progress: concatProgress });
     }
     
     writeStream.end();
@@ -203,7 +212,7 @@ async function processVideoJob(uploadId: string, fileName: string, totalChunks: 
     const stats = fs.statSync(inputPath);
     const sizeMB = (stats.size / 1024 / 1024).toFixed(2);
     console.log(`Job ${uploadId}: Arquivo concatenado (${sizeMB} MB).`);
-    updateJob({ progress: 30 });
+    updateJob({ stage: 'probing', progress: 30 });
     
     if (stats.size === 0) {
       throw new Error('O arquivo final está vazio após a concatenação.');
@@ -238,7 +247,7 @@ async function processVideoJob(uploadId: string, fileName: string, totalChunks: 
     });
 
     console.log(`Job ${uploadId}: Duração: ${duration}s. Modo: ${splitMode || 'parts'}`);
-    updateJob({ progress: 40 });
+    updateJob({ stage: 'splitting', progress: 40 });
     
     let segmentTime: number;
     if (splitMode === 'minutes') {
@@ -276,7 +285,7 @@ async function processVideoJob(uploadId: string, fileName: string, totalChunks: 
         .run();
     });
 
-    updateJob({ progress: 70 });
+    updateJob({ progress: 90 });
 
     const files = fs.readdirSync(outputDir).filter(f => f.endsWith('.mp4'));
     console.log(`Job ${uploadId}: Encontrados ${files.length} segmentos`);
@@ -297,54 +306,40 @@ async function processVideoJob(uploadId: string, fileName: string, totalChunks: 
       throw new Error('Nenhum segmento foi gerado pelo FFmpeg. Tente outro formato ou verifique o arquivo.');
     }
 
-    // Create ZIP on disk first
-    console.log(`Job ${uploadId}: Criando arquivo ZIP...`);
-    const output = fs.createWriteStream(zipPath);
-    const archive = archiver('zip', { zlib: { level: 0 } });
-
-    await new Promise((resolve, reject) => {
-      output.on('close', () => resolve(null));
-      archive.on('error', (err) => {
-        console.error(`Job ${uploadId}: Erro no Archiver:`, err);
-        reject(err);
-      });
-      archive.pipe(output);
-
-      const sortedFiles = validFiles.map(f => f.name).sort((a, b) => {
-        const matchA = a.match(/\d+/);
-        const matchB = b.match(/\d+/);
-        const numA = matchA ? parseInt(matchA[0]) : 0;
-        const numB = matchB ? parseInt(matchB[0]) : 0;
-        return numA - numB;
-      });
-
-      sortedFiles.forEach((file, index) => {
-        const filePath = path.join(outputDir, file);
-        archive.file(filePath, { name: `${index + 1}.mp4` });
-      });
-
-      archive.finalize();
+    // Build segment list for individual downloads (NO ZIP!)
+    const sortedFiles = validFiles.map(f => f.name).sort((a, b) => {
+      const matchA = a.match(/\d+/);
+      const matchB = b.match(/\d+/);
+      const numA = matchA ? parseInt(matchA[0]) : 0;
+      const numB = matchB ? parseInt(matchB[0]) : 0;
+      return numA - numB;
     });
 
-    const zipStats = fs.statSync(zipPath);
-    console.log(`Job ${uploadId}: ZIP criado (${(zipStats.size / 1024 / 1024).toFixed(2)} MB).`);
-    
-    if (zipStats.size < 100) {
-      throw new Error('O arquivo ZIP gerado está vazio ou corrompido.');
-    }
+    const segments: SegmentInfo[] = sortedFiles.map((file, index) => {
+      const fileStat = fs.statSync(path.join(outputDir, file));
+      return {
+        index: index + 1,
+        name: `${originalName}_parte_${index + 1}.mp4`,
+        sizeMB: (fileStat.size / 1024 / 1024).toFixed(1),
+        downloadUrl: `/api/segment/${uploadId}/${file}?name=${encodeURIComponent(`${originalName}_parte_${index + 1}.mp4`)}`,
+      };
+    });
+
+    console.log(`Job ${uploadId}: ${segments.length} segmentos prontos para download.`);
 
     updateJob({ 
       status: 'completed', 
+      stage: 'done',
       progress: 100,
-      downloadUrl: `/api/download/${uploadId}?name=${encodeURIComponent(originalName)}`,
-      zipSize: zipStats.size
+      segments,
     });
 
-    // Cleanup after 1 hour
+    // Delete the input file immediately (no longer needed)
+    if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
+
+    // Cleanup segments after 1 hour
     setTimeout(() => {
       try {
-        if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
-        if (fs.existsSync(zipPath)) fs.unlinkSync(zipPath);
         if (fs.existsSync(outputDir)) {
           fs.rmSync(outputDir, { recursive: true, force: true });
         }
@@ -359,6 +354,7 @@ async function processVideoJob(uploadId: string, fileName: string, totalChunks: 
     jobs.set(uploadId, { 
       id: uploadId, 
       status: 'error', 
+      stage: 'done',
       progress: 0, 
       error: err instanceof Error ? err.message : String(err) 
     });
@@ -367,7 +363,6 @@ async function processVideoJob(uploadId: string, fileName: string, totalChunks: 
     setTimeout(() => {
       if (fs.existsSync(chunkDir)) fs.rmSync(chunkDir, { recursive: true, force: true });
       if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
-      if (fs.existsSync(zipPath)) fs.unlinkSync(zipPath);
       if (fs.existsSync(outputDir)) fs.rmSync(outputDir, { recursive: true, force: true });
     }, 5000);
   }
@@ -383,141 +378,24 @@ app.get('/api/job-status/:jobId', (req, res) => {
   res.json(job);
 });
 
-// New route for downloading the ZIP file
-app.get('/api/download/:uploadId', (req, res) => {
-  const { uploadId } = req.params;
-  const fileName = req.query.name || 'video_dividido';
-  const zipPath = path.join(uploadsDir, `final_${uploadId}.zip`);
-
-  if (!fs.existsSync(zipPath)) {
-    console.error(`Arquivo ZIP não encontrado: ${zipPath}`);
-    return res.status(404).send('Arquivo não encontrado ou expirado.');
-  }
-
-  const zipName = `${fileName}_dividido.zip`;
-  console.log(`Iniciando download do ZIP: ${zipName}`);
-  res.download(zipPath, zipName, (err) => {
-    if (err) {
-      console.error('Erro no download do arquivo ZIP:', err);
-    } else {
-      console.log(`Download do ZIP ${zipName} concluído com sucesso.`);
-    }
-  });
-});
-
-// API: Split video (Legacy - for small files if needed, but we'll use chunked for all)
-app.post('/api/split', (req, res, next) => {
-  upload.single('video')(req, res, (err) => {
-    if (err instanceof multer.MulterError) {
-      console.error('Erro do Multer:', err);
-      return res.status(400).json({ error: `Erro no upload: ${err.message}` });
-    } else if (err) {
-      console.error('Erro desconhecido no upload:', err);
-      return res.status(500).json({ error: 'Erro interno no upload' });
-    }
-    next();
-  });
-}, async (req, res) => {
-  console.log('Recebendo solicitação de divisão de vídeo...');
-  if (!req.file) {
-    console.error('Nenhum arquivo recebido');
-    return res.status(400).json({ error: 'Nenhum vídeo enviado' });
-  }
-
-  console.log(`Arquivo recebido: ${req.file.originalname} (${req.file.size} bytes)`);
-  const inputPath = req.file.path;
-  const outputDir = path.join(uploadsDir, `split_${Date.now()}`);
-  fs.mkdirSync(outputDir);
-
-  const originalName = req.file.originalname.replace(/\.[^/.]+$/, "");
+// API: Download individual segment
+app.get('/api/segment/:uploadId/:fileName', (req, res) => {
+  const { uploadId, fileName: segFile } = req.params;
+  const downloadName = (req.query.name as string) || segFile;
   
-  try {
-    console.log('Iniciando processamento FFmpeg...');
-    // Split into 1-minute segments
-    await new Promise((resolve, reject) => {
-      ffmpeg(inputPath)
-        .outputOptions([
-          '-f', 'segment',
-          '-segment_time', '60',
-          '-c', 'copy',
-          '-reset_timestamps', '1'
-        ])
-        .output(path.join(outputDir, 'part_%d.mp4'))
-        .on('start', (command) => {
-          console.log('Comando FFmpeg:', command);
-        })
-        .on('progress', (progress) => {
-          console.log(`Progresso: ${progress.percent}%`);
-        })
-        .on('end', () => {
-          console.log('FFmpeg concluído com sucesso');
-          resolve(null);
-        })
-        .on('error', (err) => {
-          console.error('Erro FFmpeg:', err);
-          reject(err);
-        })
-        .run();
-    });
+  // Sanitize to prevent path traversal
+  const safeFile = path.basename(segFile);
+  const segPath = path.join(uploadsDir, `split_${uploadId}`, safeFile);
 
-    console.log('Criando arquivo ZIP...');
-    // Create ZIP
-    const archive = archiver('zip', { zlib: { level: 9 } });
-    const zipName = `${originalName}_dividido.zip`;
-    
-    res.attachment(zipName);
-    archive.pipe(res);
-
-    const files = fs.readdirSync(outputDir);
-    console.log(`Encontrados ${files.length} segmentos`);
-    
-    if (files.length === 0) {
-      throw new Error('Nenhum segmento foi gerado. Verifique se o arquivo de vídeo é válido.');
-    }
-
-    files.sort((a, b) => {
-      const numA = parseInt(a.match(/\d+/)![0]);
-      const numB = parseInt(b.match(/\d+/)![0]);
-      return numA - numB;
-    });
-
-    files.forEach((file, index) => {
-      archive.file(path.join(outputDir, file), { name: `${index + 1}.mp4` });
-    });
-
-    await archive.finalize();
-    console.log('ZIP finalizado e enviado');
-
-    // Cleanup
-    setTimeout(() => {
-      try {
-        if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
-        if (fs.existsSync(outputDir)) {
-          const files = fs.readdirSync(outputDir);
-          files.forEach(f => fs.unlinkSync(path.join(outputDir, f)));
-          fs.rmdirSync(outputDir);
-        }
-        console.log('Limpeza concluída');
-      } catch (e) {
-        console.error('Erro na limpeza:', e);
-      }
-    }, 5000);
-
-  } catch (err) {
-    console.error('Erro no processamento:', err);
-    res.status(500).json({ error: `Erro ao processar o vídeo: ${err instanceof Error ? err.message : String(err)}` });
-    // Cleanup on error
-    if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
-    if (fs.existsSync(outputDir)) {
-      try {
-        const files = fs.readdirSync(outputDir);
-        files.forEach(f => fs.unlinkSync(path.join(outputDir, f)));
-        fs.rmdirSync(outputDir);
-      } catch (e) {
-        console.error('Erro na limpeza pós-erro:', e);
-      }
-    }
+  if (!fs.existsSync(segPath)) {
+    return res.status(404).send('Segmento não encontrado ou expirado.');
   }
+
+  res.download(segPath, downloadName, (err) => {
+    if (err && !res.headersSent) {
+      console.error('Erro no download do segmento:', err);
+    }
+  });
 });
 
 // Catch-all for unmatched API routes

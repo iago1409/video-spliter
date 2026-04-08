@@ -13,16 +13,24 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
+interface SegmentInfo {
+  index: number;
+  name: string;
+  sizeMB: string;
+  downloadUrl: string;
+}
+
 interface VideoFile {
   id: string;
   file: File;
   status: 'pending' | 'uploading' | 'processing' | 'completed' | 'error';
   progress: number;
+  stage?: string;
   parts: number;
   minutes: number;
   splitMode: 'parts' | 'minutes';
   error?: string;
-  zipUrl?: string;
+  segments?: SegmentInfo[];
 }
 
 export default function App() {
@@ -223,7 +231,7 @@ export default function App() {
 
       while (!jobCompleted && pollCount < maxPolls) {
         pollCount++;
-        await new Promise(r => setTimeout(r, 3000));
+        await new Promise(r => setTimeout(r, 2000));
         
         try {
           const statusRes = await fetch(`/api/job-status/${jobId}`);
@@ -239,22 +247,14 @@ export default function App() {
           if (job.status === 'completed') {
             jobCompleted = true;
             setVideoFiles(prev => prev.map(f => 
-              f.id === id ? { ...f, status: 'completed', zipUrl: job.downloadUrl } : f
+              f.id === id ? { ...f, status: 'completed', segments: job.segments } : f
             ));
-
-            // Automatically trigger download
-            const a = document.createElement('a');
-            a.href = job.downloadUrl;
-            a.download = `${file.name.replace(/\.[^/.]+$/, "")}_dividido.zip`;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
           } else if (job.status === 'error') {
             throw new Error(job.error || 'Erro no processamento do vídeo');
           } else {
-            // Update progress based on job progress
+            // Update progress and stage
             setVideoFiles(prev => prev.map(f => 
-              f.id === id ? { ...f, progress: job.progress } : f
+              f.id === id ? { ...f, progress: job.progress, stage: job.stage } : f
             ));
           }
         } catch (pollErr) {
@@ -286,12 +286,29 @@ export default function App() {
     setIsProcessingAll(false);
   };
 
-  const downloadZip = (videoFile: VideoFile) => {
-    if (!videoFile.zipUrl) return;
+  const downloadSegment = (url: string, name: string) => {
     const a = document.createElement('a');
-    a.href = videoFile.zipUrl;
-    a.download = `${videoFile.file.name.replace(/\.[^/.]+$/, "")}_dividido.zip`;
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
     a.click();
+    document.body.removeChild(a);
+  };
+
+  const downloadAllSegments = (videoFile: VideoFile) => {
+    if (!videoFile.segments) return;
+    videoFile.segments.forEach((seg, i) => {
+      setTimeout(() => downloadSegment(seg.downloadUrl, seg.name), i * 500);
+    });
+  };
+
+  const getStageLabel = (stage?: string) => {
+    switch (stage) {
+      case 'concatenating': return 'Montando arquivo...';
+      case 'probing': return 'Analisando vídeo...';
+      case 'splitting': return 'Dividindo com FFmpeg...';
+      default: return 'Processando...';
+    }
   };
 
   const clearAll = () => {
@@ -667,9 +684,19 @@ export default function App() {
                         )}
 
                         {vf.status === 'processing' && (
-                          <div className="flex items-center gap-2 text-blue-400 text-sm">
-                            <Loader2 className="w-4 h-4 animate-spin" />
-                            <span>Processando no Servidor...</span>
+                          <div className="flex flex-col items-end gap-1">
+                            <div className="flex items-center gap-2 text-blue-400 text-sm">
+                              <Loader2 className="w-4 h-4 animate-spin" />
+                              <span>{getStageLabel(vf.stage)}</span>
+                            </div>
+                            <div className="w-32 h-1 bg-white/10 rounded-full overflow-hidden">
+                              <motion.div 
+                                className="h-full bg-blue-500"
+                                animate={{ width: `${vf.progress}%` }}
+                                transition={{ duration: 0.5 }}
+                              />
+                            </div>
+                            <span className="text-[10px] text-gray-500">{vf.progress}%</span>
                           </div>
                         )}
                         
@@ -677,12 +704,12 @@ export default function App() {
                           <div className="flex items-center gap-3">
                             <span className="text-green-500 text-sm flex items-center gap-1">
                               <CheckCircle2 className="w-4 h-4" />
-                              Concluído
+                              {vf.segments?.length} partes
                             </span>
                             <button 
-                              onClick={() => downloadZip(vf)}
+                              onClick={() => downloadAllSegments(vf)}
                               className="p-2 bg-white/5 hover:bg-white/10 rounded-lg text-white transition-colors"
-                              title="Baixar ZIP"
+                              title="Baixar todas as partes"
                             >
                               <Download className="w-4 h-4" />
                             </button>
@@ -723,6 +750,24 @@ export default function App() {
                           <X className="w-4 h-4" />
                         </button>
                       </div>
+
+                      {/* Segment download list */}
+                      {vf.status === 'completed' && vf.segments && vf.segments.length > 0 && (
+                        <div className="absolute left-0 right-0 -bottom-1 translate-y-full bg-white/[0.02] border border-white/5 rounded-b-2xl px-4 py-3 z-10">
+                          <div className="flex flex-wrap gap-2">
+                            {vf.segments.map(seg => (
+                              <button
+                                key={seg.index}
+                                onClick={() => downloadSegment(seg.downloadUrl, seg.name)}
+                                className="flex items-center gap-1.5 px-3 py-1.5 bg-green-500/10 hover:bg-green-500/20 text-green-400 rounded-lg text-xs font-medium transition-colors border border-green-500/10"
+                              >
+                                <Download className="w-3 h-3" />
+                                Parte {seg.index} ({seg.sizeMB} MB)
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      )}
                     </motion.div>
                   ))}
                 </div>
